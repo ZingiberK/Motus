@@ -231,3 +231,19 @@ datasets/*
 scripts_new/
 scripts/run_local.sh
 scripts/manual_multi_node_srun.sh
+# --- HELIX VLA+Motus migration: ignore legacy WRM training artifacts ---
+runs/
+data/residual/
+wrm_rl/
+models/wrm.py
+models/wrm_und.py
+scripts/train_wrm*.py
+scripts/run_train_wrm*.sh
+scripts/wrm_smoke.py
+scripts/test_flowgrpo_sampler.py
+WRM_PLAN.md
+WRM_RL_PLAN.md
+WRM_RL_PLAN_PPO.md
+WRM_RL_PLAN_WAM_WARMUP.md
+*.pt
+*.npz

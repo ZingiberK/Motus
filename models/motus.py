@@ -17,7 +17,11 @@ if BAK_ROOT not in sys.path:
 
 from utils.common import get_t_distribution
 from wan.modules.model import sinusoidal_embedding_1d
-from transformers import Qwen3VLForConditionalGeneration, AutoConfig
+try:
+    from transformers import Qwen3VLForConditionalGeneration, AutoConfig
+except Exception:  # older transformers (e.g. eval env); only needed by full Motus, not WRM
+    Qwen3VLForConditionalGeneration = None
+    from transformers import AutoConfig
 from .wan_model import WanVideoModel
 from .action_expert import ActionExpert, ActionExpertConfig
 from .und_expert import UndExpert, UndExpertConfig
