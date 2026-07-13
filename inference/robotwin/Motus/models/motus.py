@@ -4,6 +4,7 @@
 
 import sys
 import json
+import math
 import torch
 import logging
 import torch.nn as nn
@@ -1173,6 +1174,240 @@ class Motus(nn.Module):
             action_velocity = action_pred_full[:, 1:-self.action_expert.config.num_registers, :]
 
         return torch.nn.functional.mse_loss(action_velocity.float(), target_v.float())
+
+    # ------------------------------------------------------------------ Flow-SDE RL
+    # Video branch = supervised FM on observed futures; action branch = PPO on
+    # Flow-SDE log-probs. See Motus/MOTUS_RL_PLAN_PPO.md (adapted from WRM_RL_PLAN_PPO.md).
+
+    def _joint_velocities(
+        self,
+        video_latent: torch.Tensor,
+        action_latent: torch.Tensor,
+        t_scaled: torch.Tensor,
+        state: torch.Tensor,
+        und_tokens: torch.Tensor,
+        processed_t5_context,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One MoT denoise step → (action_velocity, video_velocity)."""
+        B = action_latent.shape[0]
+        video_tokens = self.video_module.prepare_input(video_latent.to(self.dtype))
+        state_tokens = state.unsqueeze(1).to(self.dtype)
+        registers = self.action_expert.registers.expand(B, -1, -1)
+        action_tokens = self.action_expert.input_encoder(state_tokens, action_latent, registers)
+        with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
+            video_head_time_emb, video_adaln_params = self.video_module.get_time_embedding(
+                t_scaled, video_tokens.shape[1]
+            )
+            action_head_time_emb, action_adaln_params = self.action_module.get_time_embedding(
+                t_scaled, action_tokens.shape[1]
+            )
+            und = und_tokens
+            for layer_idx in range(self.config.num_layers):
+                video_adaln_modulation = self.video_module.compute_adaln_modulation(video_adaln_params, layer_idx)
+                action_adaln_modulation = self.action_module.compute_adaln_modulation(action_adaln_params, layer_idx)
+                video_tokens, action_tokens, und = self.video_module.process_joint_attention(
+                    video_tokens, action_tokens, video_adaln_modulation, action_adaln_modulation, layer_idx,
+                    self.action_expert.blocks[layer_idx], und, self.und_expert.blocks[layer_idx],
+                )
+                video_tokens = self.video_module.process_cross_attention(
+                    video_tokens, video_adaln_params, layer_idx, processed_t5_context
+                )
+                video_tokens = self.video_module.process_ffn(video_tokens, video_adaln_modulation, layer_idx)
+                action_tokens = self.action_module.process_ffn(action_tokens, action_adaln_modulation, layer_idx)
+                und = self.und_module.process_ffn(und, layer_idx)
+            video_velocity = self.video_module.apply_output_head(video_tokens, video_head_time_emb)
+            action_pred_full = self.action_expert.decoder(action_tokens, action_head_time_emb)
+            action_velocity = action_pred_full[:, 1:-self.action_expert.config.num_registers, :]
+        return action_velocity, video_velocity
+
+    def sample_actions_sde(
+        self,
+        first_frame: torch.Tensor,
+        state: torch.Tensor,
+        language_embeddings: Optional[List[torch.Tensor]] = None,
+        vlm_inputs: Optional[List] = None,
+        num_inference_steps: int = 10,
+        eta: float = 0.5,
+        generator: Optional[torch.Generator] = None,
+        action_init: Optional[torch.Tensor] = None,
+        start_t: float = 1.0,
+    ) -> Dict[str, torch.Tensor]:
+        """Stochastic Flow-SDE sampling for Motus action (absolute raw qpos).
+
+        Euler–Maruyama on the FM ODE: ``x ← x + v·dt + η√|dt|·ε``. Stores the
+        full denoise trajectory so :meth:`action_logprob_from_trace` can rebuild
+        the importance ratio for PPO.
+
+        Args:
+            action_init / start_t: optional SDEdit prior (e.g. freq-aligned a_vla).
+                ``start_t=1.0`` (default) = pure Motus from noise.
+        Returns dict with ``action``, ``action_latents`` [K+1,B,chunk,D],
+        ``video_latents``, ``timesteps``, ``eta``, ``old_logprob`` [B].
+        """
+        assert eta > 0.0, "SDE sampling requires eta > 0 for a non-degenerate log-prob"
+        B = first_frame.shape[0]
+        language_embeddings = [emb.to(self.device).to(self.dtype) for emb in language_embeddings]
+        state = state.to(self.device).to(self.dtype)
+        first_frame = first_frame.to(self.device).to(self.dtype)
+
+        first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)
+        with torch.no_grad():
+            condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))
+        B, C_latent, _, H_latent, W_latent = condition_frame_latent.shape
+        num_total_latent_frames = 1 + self.config.num_video_frames // 4
+        chunk = self.config.action_chunk_size
+
+        # ---- init latents (pure noise or SDEdit blend) ----
+        st = float(start_t)
+        if action_init is None or st >= 1.0 - 1e-6:
+            action_latent = torch.randn(
+                (B, chunk, self.config.action_dim), device=self.device, dtype=self.dtype, generator=generator
+            )
+            video_latent = torch.randn(
+                (B, C_latent, num_total_latent_frames, H_latent, W_latent),
+                device=self.device, dtype=self.dtype, generator=generator,
+            )
+            video_latent[:, :, 0:1] = condition_frame_latent
+            st = 1.0
+        else:
+            a_init = torch.zeros((B, chunk, self.config.action_dim), device=self.device, dtype=self.dtype)
+            n_in = min(action_init.shape[1], chunk)
+            a_init[:, :n_in] = action_init.to(self.device, self.dtype)[:, :n_in]
+            if n_in < chunk:
+                a_init[:, n_in:] = a_init[:, n_in - 1:n_in]
+            a_noise = torch.randn(a_init.shape, device=self.device, dtype=self.dtype, generator=generator)
+            action_latent = (1.0 - st) * a_init + st * a_noise
+            video_clean = condition_frame_latent.repeat(1, 1, num_total_latent_frames, 1, 1)
+            v_noise = torch.randn(video_clean.shape, device=self.device, dtype=self.dtype, generator=generator)
+            video_latent = (1.0 - st) * video_clean + st * v_noise
+            video_latent[:, :, 0:1] = condition_frame_latent
+
+        with torch.no_grad():
+            und_tokens = self.und_module.extract_und_features(vlm_inputs)
+        processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
+
+        timesteps = torch.linspace(st, 0.0, num_inference_steps + 1, device=self.device, dtype=self.dtype)
+        action_latents: List[torch.Tensor] = [action_latent.clone()]
+        video_latents: List[torch.Tensor] = [video_latent.clone()]
+        old_logprob = torch.zeros(B, device=self.device, dtype=torch.float32)
+
+        for i in range(num_inference_steps):
+            t = timesteps[i]
+            dt = timesteps[i + 1] - t
+            t_scaled = (t * 1000).expand(B).to(self.dtype)
+            action_velocity, video_velocity = self._joint_velocities(
+                video_latent, action_latent, t_scaled, state, und_tokens, processed_t5_context
+            )
+            # fp32 mean matching action_logprob_from_trace (ratio≈1 at θ_k)
+            mean = action_latent.float() + action_velocity.float() * float(dt)
+            sigma_i = float(eta) * math.sqrt(abs(float(dt)))
+            noise = torch.randn(mean.shape, device=self.device, dtype=torch.float32, generator=generator)
+            new_action = mean + sigma_i * noise
+            action_latent = new_action.to(self.dtype)
+            action_latents.append(action_latent.clone())
+            realized = action_latent.float()
+            logp_i = (
+                -0.5 * ((realized - mean) / sigma_i) ** 2
+                - math.log(sigma_i)
+                - 0.5 * math.log(2.0 * math.pi)
+            )
+            old_logprob = old_logprob + logp_i.sum(dim=(-1, -2))
+
+            video_latent = video_latent + video_velocity * dt
+            video_latent[:, :, 0:1] = condition_frame_latent
+            video_latents.append(video_latent.clone())
+
+        return {
+            "action": action_latent.float(),
+            "action_latents": torch.stack(action_latents, dim=0),
+            "video_latents": torch.stack(video_latents, dim=0),
+            "timesteps": timesteps,
+            "eta": torch.tensor(float(eta)),
+            "old_logprob": old_logprob,
+            "start_t": torch.tensor(float(st)),
+        }
+
+    def action_logprob_from_trace(
+        self,
+        state: torch.Tensor,
+        language_embeddings: Optional[List[torch.Tensor]],
+        vlm_inputs: Optional[List],
+        action_latents: torch.Tensor,   # [K+1, B, chunk, D]
+        video_latents: torch.Tensor,    # [K+1, B, C, n, H, W]
+        timesteps: torch.Tensor,        # [K+1]
+        eta: float,
+        use_checkpoint: bool = False,
+        und_tokens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Recompute Flow-SDE log-prob of a stored Motus denoise trajectory. Returns [B]."""
+        B = action_latents.shape[1]
+        language_embeddings = [emb.to(self.device).to(self.dtype) for emb in language_embeddings]
+        state = state.to(self.device).to(self.dtype)
+        processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
+        if und_tokens is None:
+            with torch.no_grad():
+                und_tokens = self.und_module.extract_und_features(vlm_inputs)
+        else:
+            und_tokens = und_tokens.to(self.device, self.dtype)
+
+        timesteps = timesteps.to(self.device)
+        K = timesteps.shape[0] - 1
+        logprob = torch.zeros(B, device=self.device, dtype=torch.float32)
+
+        for i in range(K):
+            t = timesteps[i]
+            dt = timesteps[i + 1] - t
+            t_scaled = (t * 1000).expand(B).to(self.device, self.dtype)
+            x_i = action_latents[i].to(self.device, self.dtype)
+            x_next = action_latents[i + 1].to(self.device).float()
+            video_latent_i = video_latents[i].to(self.device, self.dtype)
+
+            def _step(vl, xi, ts):
+                av, _ = self._joint_velocities(vl, xi, ts, state, und_tokens, processed_t5_context)
+                return av
+
+            if use_checkpoint and torch.is_grad_enabled():
+                action_velocity = torch.utils.checkpoint.checkpoint(
+                    _step, video_latent_i, x_i, t_scaled, use_reentrant=False
+                )
+            else:
+                action_velocity = _step(video_latent_i, x_i, t_scaled)
+
+            mean = x_i.float() + action_velocity.float() * float(dt)
+            sigma_i = float(eta) * math.sqrt(abs(float(dt)))
+            logp_i = (
+                -0.5 * ((x_next - mean) / sigma_i) ** 2
+                - math.log(sigma_i)
+                - 0.5 * math.log(2.0 * math.pi)
+            )
+            logprob = logprob + logp_i.sum(dim=(-1, -2))
+        return logprob
+
+    def video_supervised_loss(
+        self,
+        first_frame: torch.Tensor,     # [B, C, H, W] in [0,1] composite
+        video_frames: torch.Tensor,    # [B, T, C, H, W] in [0,1] observed futures
+        state: torch.Tensor,
+        actions_exec: torch.Tensor,    # [B, chunk, D] executed absolute qpos
+        language_embeddings: Optional[List[torch.Tensor]] = None,
+        vlm_inputs: Optional[List] = None,
+    ) -> torch.Tensor:
+        """Supervised video FM on RL-observed futures (failing dynamics included).
+
+        Reuses :meth:`training_step`'s video pipeline with ``actions=actions_exec``.
+        Action-expert grads should be frozen by the learner's video pass; only
+        the returned ``video_loss`` is used.
+        """
+        out = self.training_step(
+            first_frame=first_frame,
+            video_frames=video_frames,
+            state=state,
+            actions=actions_exec.to(self.device, self.dtype),
+            language_embeddings=language_embeddings,
+            vlm_inputs=vlm_inputs,
+            return_dict=True,
+        )
+        return out["video_loss"]
 
     # Alternative inference (DPM++ solver)
     '''

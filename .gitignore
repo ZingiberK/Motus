@@ -234,7 +234,8 @@ scripts/manual_multi_node_srun.sh
 # --- HELIX VLA+Motus migration: ignore legacy WRM training artifacts ---
 runs/
 data/residual/
-wrm_rl/
+wrm_rl/                 # working tree (pycache); shipped copy lives in legacy/wrm_rl/
+# motus_rl/ is tracked (Motus-adapted Flow-SDE PPO)
 models/wrm.py
 models/wrm_und.py
 scripts/train_wrm*.py

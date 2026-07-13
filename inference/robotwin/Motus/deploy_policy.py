@@ -279,6 +279,63 @@ class MotusPolicy:
 
         return actions_real
 
+    def get_action_sde(self, num_inference_steps: int = 10, eta: float = 0.5,
+                       action_init=None, start_t: float = 1.0, seed: int = -1):
+        """Flow-SDE sample for Motus RL rollouts. Returns ``(actions_np, trace_dict)``.
+
+        ``trace_dict`` is CPU tensors for ``torch.save`` (see ``MOTUS_RL_PLAN_PPO.md``).
+        Optional ``action_init`` + ``start_t<1`` = SDEdit-anchored exploration around VLA.
+        """
+        if len(self.obs_cache) == 0 or self.current_state is None:
+            raise ValueError("No observation/state. Call update_obs first.")
+        current_frame = self.obs_cache[-1]
+        scene_prefix = ("The whole scene is in a realistic, industrial art style with three views: "
+                        "a fixed rear camera, a movable left arm camera, and a movable right arm camera. "
+                        "The aloha robot is currently performing the following task: ")
+        instruction = f"{scene_prefix}{self.current_instruction}"
+        t5_out = self.t5_encoder([instruction], self.device)
+        if isinstance(t5_out, torch.Tensor):
+            t5_list = [t5_out.squeeze(0)] if t5_out.dim() == 3 else [t5_out]
+        elif isinstance(t5_out, list):
+            t5_list = t5_out
+        else:
+            raise ValueError("Unexpected T5 encoder output format")
+        first_frame_pil = self._tensor_to_pil_image(current_frame.squeeze(0).cpu())
+        vlm_inputs = self._preprocess_vlm_messages(instruction, first_frame_pil)
+        a_init = None
+        if action_init is not None:
+            a_init = torch.as_tensor(action_init, dtype=torch.float32, device=self.device)
+            if a_init.dim() == 2:
+                a_init = a_init.unsqueeze(0)
+        gen = torch.Generator(device=self.device).manual_seed(seed) if seed >= 0 else None
+        with torch.no_grad():
+            out = self.model.sample_actions_sde(
+                first_frame=current_frame, state=self.current_state,
+                language_embeddings=t5_list, vlm_inputs=[vlm_inputs],
+                num_inference_steps=num_inference_steps, eta=float(eta),
+                generator=gen, action_init=a_init, start_t=float(start_t),
+            )
+        actions = out["action"].squeeze(0).cpu().numpy()
+        self.action_cache.extend(actions)
+        al = out["action_latents"].cpu()
+        vl = out["video_latents"].cpu()
+        if al.dim() == 4 and al.shape[1] == 1:
+            al = al.squeeze(1)
+        if vl.dim() == 6 and vl.shape[1] == 1:
+            vl = vl.squeeze(1)
+        trace = {
+            "action_latents": al, "video_latents": vl,
+            "timesteps": out["timesteps"].cpu(),
+            "eta": float(out["eta"]),
+            "old_logprob": float(out["old_logprob"].reshape(-1)[0]),
+            "action": out["action"].squeeze(0).cpu(),
+            "state": self.current_state.squeeze(0).cpu(),
+            "first_frame": current_frame.squeeze(0).cpu(),
+            "instruction": self.current_instruction,
+            "start_t": float(out["start_t"]),
+        }
+        return actions, trace
+
     def get_action_sdedit(self, action_init, start_t: float = 0.3, num_inference_steps: int = None) -> np.ndarray:
         """SDEdit action refinement: denoise from a partially-noised ``action_init``
         (e.g. a frequency-aligned a_vla) instead of pure noise. Mirrors :meth:`get_action`
