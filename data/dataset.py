@@ -184,6 +184,32 @@ def create_dataset(config: OmegaConf, val: bool = False):
         
         return AlohaAgilex2Dataset(**params)
 
+    elif dataset_type == 'vla_rollout':
+        from .vla_rollout_dataset import VLARolloutDataset
+
+        params = {}
+        if hasattr(config, 'common'):
+            params.update({
+                'global_downsample_rate': config.common.global_downsample_rate,
+                'video_action_freq_ratio': config.common.video_action_freq_ratio,
+                'num_video_frames': config.common.num_video_frames,
+                'video_size': (config.common.video_height, config.common.video_width),
+            })
+        if hasattr(config.dataset, 'dataset_dir'):
+            params['dataset_dir'] = config.dataset.dataset_dir
+        if hasattr(config.dataset, 'max_episodes'):
+            params['max_episodes'] = config.dataset.max_episodes
+        if hasattr(config.dataset, 'image_aug'):
+            params['image_aug'] = config.dataset.image_aug and not val
+        if hasattr(config.dataset, 'lang_cache_path'):
+            params['lang_cache_path'] = config.dataset.lang_cache_path
+        if hasattr(config.model, 'vlm') and hasattr(config.model.vlm, 'checkpoint_path'):
+            params['vlm_checkpoint_path'] = config.model.vlm.checkpoint_path
+        if hasattr(config.dataset, 'params'):
+            params.update(OmegaConf.to_object(config.dataset.params))
+        params['val'] = val
+        return VLARolloutDataset(**params)
+
     elif dataset_type == 'lerobot':
         from .lerobot.lerobot_dataset import LeRobotMotusDataset
 

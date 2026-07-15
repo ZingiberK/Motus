@@ -1,7 +1,6 @@
 """Offline PPO update for Motus (one round) — Flow-SDE PPO + supervised WM.
 
-Adapted from ``legacy/wrm_rl/ppo_update.py`` (WRM). Same recipe as
-``MOTUS_RL_PLAN_PPO.md`` / ``WRM_RL_PLAN_PPO.md``:
+Phase 2 of the single-version pipeline (see ``Motus/MOTUS_PLAN.md``). Isolated:
 
   * **Action expert** — PPO on Flow-SDE denoise log-probs
     (``Motus.sample_actions_sde`` / ``action_logprob_from_trace``).
@@ -9,7 +8,7 @@ Adapted from ``legacy/wrm_rl/ppo_update.py`` (WRM). Same recipe as
     (``Motus.video_supervised_loss``); never receives policy gradients.
   * **Und** — shared hub, trains in both passes.
 
-Trace schema (per chunk, saved by Motus RL rollout server — see plan §5)::
+Trace schema (per chunk, saved by Motus RL rollout server — see MOTUS_PLAN.md)::
 
     {
       "action_latents": [K+1, chunk, D],   # or [K+1, 1, chunk, D]
@@ -75,9 +74,30 @@ def _ensure_bk(t: torch.Tensor, name: str) -> torch.Tensor:
     return t
 
 
+def _build_t5_vlm(policy, ff: torch.Tensor, instruction: str):
+    """Build Motus T5 + VLM conditioning from a composite first-frame [1,3,H,W]."""
+    scene_prefix = (
+        "The whole scene is in a realistic, industrial art style with three views: "
+        "a fixed rear camera, a movable left arm camera, and a movable right arm camera. "
+        "The aloha robot is currently performing the following task: "
+    )
+    full_instr = f"{scene_prefix}{instruction}"
+    t5_out = policy.t5_encoder([full_instr], policy.device)
+    if isinstance(t5_out, torch.Tensor):
+        t5_list = [t5_out.squeeze(0)] if t5_out.dim() == 3 else [t5_out]
+    else:
+        t5_list = t5_out
+    first_frame_pil = policy._tensor_to_pil_image(ff.squeeze(0).cpu())
+    vlm_inputs = policy._preprocess_vlm_messages(full_instr, first_frame_pil)
+    return t5_list, vlm_inputs
+
+
 def prep_cond(policy, tr: dict):
-    """Rebuild Motus T5 + VLM conditioning from a stored trace."""
-    from deploy_policy import MotusPolicy  # type: ignore  # noqa: F401
+    """Rebuild Motus T5 + VLM conditioning from a stored trace.
+
+    Preferred path uses the composite ``first_frame`` stored by the rollout server.
+    Fallback builds the same composite from raw 3-view cams via ``policy.update_obs``.
+    """
     instruction = tr.get("instruction") or tr.get("meta", {}).get("instruction", "")
     if "first_frame" in tr and tr["first_frame"] is not None:
         ff = tr["first_frame"].float()
@@ -86,33 +106,28 @@ def prep_cond(policy, tr: dict):
         state = tr["state"].float()
         if state.dim() == 1:
             state = state.unsqueeze(0)
-        # Build VLM/T5 from composite already in first_frame via policy helpers
         policy.set_instruction(instruction)
         policy.obs_cache = [ff.to(policy.device)]
         policy.current_state = state.to(policy.device)
-        scene_prefix = (
-            "The whole scene is in a realistic, industrial art style with three views: "
-            "a fixed rear camera, a movable left arm camera, and a movable right arm camera. "
-            "The aloha robot is currently performing the following task: "
-        )
-        full_instr = f"{scene_prefix}{instruction}"
-        t5_out = policy.t5_encoder([full_instr], policy.device)
-        if isinstance(t5_out, torch.Tensor):
-            t5_list = [t5_out.squeeze(0)] if t5_out.dim() == 3 else [t5_out]
-        else:
-            t5_list = t5_out
-        first_frame_pil = policy._tensor_to_pil_image(ff.squeeze(0).cpu())
-        vlm_inputs = policy._preprocess_vlm_messages(full_instr, first_frame_pil)
+        t5_list, vlm_inputs = _build_t5_vlm(policy, ff, instruction)
         return ff.to(policy.device), state.to(policy.device), t5_list, vlm_inputs
 
-    # Fallback: 3 raw cams (same as finetune_motus_action.prep_inputs)
-    from finetune_motus_action import prep_inputs  # type: ignore
-    return prep_inputs(
-        policy,
-        tr["cam_high"], tr["cam_left"], tr["cam_right"],
-        tr["state"].numpy() if torch.is_tensor(tr["state"]) else tr["state"],
-        instruction,
-    )
+    # Fallback: 3 raw cams -> composite via the same pipeline as deploy inference.
+    state_np = tr["state"].numpy() if torch.is_tensor(tr["state"]) else np.asarray(tr["state"])
+    obs = {
+        "observation": {
+            "head_camera": {"rgb": np.asarray(tr["cam_high"])},
+            "left_camera": {"rgb": np.asarray(tr["cam_left"])},
+            "right_camera": {"rgb": np.asarray(tr["cam_right"])},
+        },
+        "joint_action": {"vector": np.asarray(state_np, dtype=np.float32)},
+    }
+    policy.set_instruction(instruction)
+    policy.update_obs(obs)
+    ff = policy.obs_cache[-1]
+    state = policy.current_state
+    t5_list, vlm_inputs = _build_t5_vlm(policy, ff, instruction)
+    return ff, state, t5_list, vlm_inputs
 
 
 def compute_logp(model, policy, tr, use_ckpt: bool):

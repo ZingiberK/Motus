@@ -1,6 +1,5 @@
 # Models package for Motus
 
-from .wrm import WRM, WRMConfig
-from .wrm_und import WRMUnd, WRMUndConfig
+from .motus import Motus, MotusConfig
 
-__all__ = ["WRM", "WRMConfig", "WRMUnd", "WRMUndConfig"]
+__all__ = ["Motus", "MotusConfig"]

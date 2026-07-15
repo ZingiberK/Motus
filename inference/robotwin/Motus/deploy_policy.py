@@ -283,7 +283,7 @@ class MotusPolicy:
                        action_init=None, start_t: float = 1.0, seed: int = -1):
         """Flow-SDE sample for Motus RL rollouts. Returns ``(actions_np, trace_dict)``.
 
-        ``trace_dict`` is CPU tensors for ``torch.save`` (see ``MOTUS_RL_PLAN_PPO.md``).
+        ``trace_dict`` is CPU tensors for ``torch.save`` (see ``MOTUS_PLAN.md``, Phase 2).
         Optional ``action_init`` + ``start_t<1`` = SDEdit-anchored exploration around VLA.
         """
         if len(self.obs_cache) == 0 or self.current_state is None:
@@ -335,44 +335,6 @@ class MotusPolicy:
             "start_t": float(out["start_t"]),
         }
         return actions, trace
-
-    def get_action_sdedit(self, action_init, start_t: float = 0.3, num_inference_steps: int = None) -> np.ndarray:
-        """SDEdit action refinement: denoise from a partially-noised ``action_init``
-        (e.g. a frequency-aligned a_vla) instead of pure noise. Mirrors :meth:`get_action`
-        preprocessing (composite frame + T5 + VLM), returns [chunk, action_dim] raw qpos."""
-        if len(self.obs_cache) == 0 or self.current_state is None:
-            raise ValueError("No observation/state. Call update_obs first.")
-        current_frame = self.obs_cache[-1]  # [1,3,384,320] composite in [0,1]
-
-        scene_prefix = ("The whole scene is in a realistic, industrial art style with three views: "
-                        "a fixed rear camera, a movable left arm camera, and a movable right arm camera. "
-                        "The aloha robot is currently performing the following task: ")
-        instruction = f"{scene_prefix}{self.current_instruction}"
-        t5_out = self.t5_encoder([instruction], self.device)
-        if isinstance(t5_out, torch.Tensor):
-            t5_list = [t5_out.squeeze(0)] if t5_out.dim() == 3 else [t5_out]
-        elif isinstance(t5_out, list):
-            t5_list = t5_out
-        else:
-            raise ValueError("Unexpected T5 encoder output format")
-
-        first_frame_pil = self._tensor_to_pil_image(current_frame.squeeze(0).cpu())
-        vlm_inputs = self._preprocess_vlm_messages(instruction, first_frame_pil)
-
-        steps = num_inference_steps or self.config_dict['model']['inference']['num_inference_timesteps']
-        a_init = torch.as_tensor(np.asarray(action_init), dtype=torch.float32, device=self.device)
-        if a_init.dim() == 2:
-            a_init = a_init.unsqueeze(0)  # [1, n, action_dim]
-
-        with torch.no_grad():
-            _, predicted_actions = self.model.sdedit_inference_step(
-                first_frame=current_frame, state=self.current_state, action_init=a_init,
-                start_t=float(start_t), num_inference_steps=steps,
-                language_embeddings=t5_list, vlm_inputs=[vlm_inputs], seed=-1,
-            )
-        actions_real = predicted_actions.squeeze(0).cpu().numpy()
-        self.action_cache.extend(actions_real)
-        return actions_real
 
     def _tensor_to_pil_image(self, tensor_chw: torch.Tensor) -> Image.Image:
         """Convert [C, H, W] tensor to PIL Image."""

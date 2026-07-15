@@ -1,6 +1,6 @@
-"""Motus Flow-SDE PPO + supervised World Model (adapted from WRM ``wrm_rl``).
+"""Phase 2 Motus RL: Flow-SDE PPO on the action expert + supervised World Model.
 
-See ``Motus/MOTUS_RL_PLAN_PPO.md``. Video branch = supervised FM on observed
-futures; action branch = PPO on Flow-SDE log-probs. Original WRM learner kept
-under ``legacy/wrm_rl/`` for reference.
+See ``Motus/MOTUS_PLAN.md`` (Phase 2). Isolated training:
+video (WAN) branch = supervised flow-matching on simulator-observed futures;
+action expert = PPO on Flow-SDE denoise log-probs (never mixes gradients).
 """

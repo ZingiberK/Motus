@@ -1,8 +1,7 @@
-"""Reward / advantage helpers for Motus Flow-SDE PPO.
+"""Reward / advantage helpers for Motus Flow-SDE PPO (Phase 2).
 
-Same math as ``legacy/wrm_rl/reward.py`` (WRM PPO): terminal success sparse
-reward, discounted return-to-go per action chunk, optional paired baseline
-(success_policy − success_ref) for Motus-vs-VLA contrast later.
+Terminal success sparse reward, discounted return-to-go per action chunk,
+optional paired baseline (success_policy - success_ref) for Motus-vs-VLA contrast.
 """
 
 from __future__ import annotations
@@ -37,5 +36,4 @@ def paired_baseline_returns(
     return [(gamma ** (T - 1 - t)) * outcome for t in range(T)]
 
 
-# Back-compat alias matching WRM naming
 paired_vla_returns = paired_baseline_returns
