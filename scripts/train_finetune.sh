@@ -9,13 +9,17 @@
 #   3) Set dataset.dataset_dir and finetune.checkpoint_path in configs/motus_finetune.yaml
 
 set -euo pipefail
+cd "$(dirname "$0")/.."
+# Ensure `import wan` resolves (repo ships WAN under bak/wan).
+[[ -e wan ]] || ln -s bak/wan wan
 
 TASK="motus_finetune"
 CONFIG_FILE="configs/motus_finetune.yaml"
+# Official Stage-3: 8 GPU + ZeRO-1. Single-GPU OOMs on Adam states (~5.9B trainable).
 NPROC="${NPROC:-8}"
 
 export OUTPUT_DIR="outputs/${TASK}"
-mkdir -p "$OUTPUT_DIR"
+mkdir -p "$OUTPUT_DIR" logs
 
 torchrun \
     --nnodes=1 \

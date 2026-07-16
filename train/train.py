@@ -309,19 +309,35 @@ class UniDiffuserTrainer:
         else:
             total_loss.backward()
         
-        # Gradient clipping
+        # Gradient clipping (must go through Accelerator/DeepSpeed; raw
+        # torch.nn.utils.clip_grad_norm_ is a no-op / incorrect under ZeRO).
         grad_clip_norm = self.config.training.grad_clip_norm if hasattr(self.config.training, 'grad_clip_norm') else 1.0
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
-        
+        if hasattr(self, 'accelerator') and self.accelerator is not None:
+            self.accelerator.clip_grad_norm_(self.model.parameters(), grad_clip_norm)
+        else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
+
+        # Skip the optimizer step if the loss already went non-finite (keeps
+        # weights recoverable; common when a bad batch / overflow hits bf16).
+        if not torch.isfinite(total_loss):
+            logger.warning("non-finite loss at step — skipping optimizer update")
+            metrics = {}
+            for k, v in loss_dict.items():
+                if torch.is_tensor(v):
+                    metrics[k] = float('nan') if not torch.isfinite(v) else v.item()
+                else:
+                    metrics[k] = v
+            return metrics
+
         # Optimizer step
         self.optimizer.step()
-        
+
         if self.scheduler:
             self.scheduler.step()
-        
+
         # Convert to float for logging
         metrics = {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
-        
+
         return metrics
     
     def train(self, max_steps: int, resume_from: Optional[str] = None, val_interval: int = 500, reset_scheduler: Optional[bool] = None):
